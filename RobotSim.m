@@ -1,0 +1,445 @@
+% RobotSim: a class defining a ROS node that simulates a simple 
+%           differential drive robot
+%
+%   Topics
+%   ----------
+%   Published: /robot/pose
+%   Message Type: turtlesim/Pose
+%   Info: The 2D pose of the robot including (x,y) position and the
+%         orientation angle. Also contains the current linear and angular
+%         velocities.
+%
+%   Published: /desired_path/index
+%   Message Type: std_msgs/Int32
+%   Info: The index of the desired path array that references the first
+%         point in the currently tracked segment of the path.
+%
+%   Subscribed: /robot/cmd_vel
+%   Message Type: geometry_msgs/Twist
+%   Info: The linear and angular velocity of the robot. The linear velocity
+%         command comes from Twist.Linear.X and the angular velocity
+%         command comes from Twist.Angular.Z.
+%
+%   Subscribed: /reset
+%   Message Type: std_msgs/Empty
+%   Info: Resets the robot to the starting pose at 0 velocity.
+%
+%   Author: Kyle Larsen
+%   Date: 21 Apr 2020
+
+classdef RobotSim < handle
+    properties
+        %================
+        % ROS parameters
+        %================
+        frequency; % simulation update frequency
+        delta_time; % time between position updates
+        loop_rate; % keeps the simulation running at a specific frequency
+        simulation_time; % the time in the simulation
+        waiting_for_start; % keeps the time at 0 until the first velocity
+                           % command is sent
+        % These variables are created to be used as type 'double' for all
+        % of the calculations and are then assigned to the message object,
+        % which uses type 'single'.
+        X;
+        Y;
+        Theta;
+        LinearVelocity;
+        AngularVelocity;
+        % Messages and publishers/subscribers
+        robot_pose_msg;
+        robot_pose_pub;
+        desired_path_index_msg;
+        desired_path_index_pub;
+        robot_vel_sub;
+        robot_reset_sub;
+        
+        %===================
+        % Robot Parameters
+        %===================
+        starting_pose;
+        
+        robot_length;
+        robot_width;
+        robot_objects;
+        linear_velocity_setpoint;
+        angular_velocity_setpoint;
+        linear_acceleration;
+        angular_acceleration;
+        max_linear_velocity;
+        max_angular_velocity;
+        goal_tolerance;
+        segment_tolerance;
+        
+        %=======================
+        % Visualization Objects
+        %=======================
+        grid_min_x;
+        grid_min_y;
+        grid_max_x;
+        grid_max_y;
+        window_width;
+        window_height;
+        gui_figure;
+        gui_axes;
+        shutdown_simulation;
+        exit_for_processing;
+        
+    end
+    
+    methods
+        function obj = RobotSim()
+            %===================
+            % Set starting pose
+            %===================
+            obj.starting_pose = [-2.0, -1.0, (3/4)*pi]; % [x, y, theta]
+            
+            %================
+            % ROS Parameters
+            %================
+            % Initialize ROS node
+            obj.startROS();
+            
+            % These variables are used so the type is a 'double', the
+            % message values are type 'single'
+            obj.X = obj.starting_pose(1);
+            obj.Y = obj.starting_pose(2);
+            obj.Theta = obj.starting_pose(3);
+            obj.LinearVelocity = 0.0;
+            obj.AngularVelocity = 0.0;
+            
+            % Set message from starting pose
+            obj.robot_pose_msg = rosmessage('turtlesim/Pose');
+            obj.robot_pose_msg.X = obj.X;
+            obj.robot_pose_msg.Y = obj.Y;
+            obj.robot_pose_msg.Theta = obj.Theta;
+            obj.robot_pose_msg.LinearVelocity = obj.LinearVelocity;
+            obj.robot_pose_msg.AngularVelocity = obj.AngularVelocity;
+            
+            obj.linear_velocity_setpoint = 0.0;
+            obj.angular_velocity_setpoint = 0.0;
+            obj.linear_acceleration = 1; % m/s^2
+            obj.angular_acceleration = 1; % rad/s^2
+            obj.max_linear_velocity = 1.25; % m/s
+            obj.max_angular_velocity = 7.33; % rad/s
+            
+            obj.desired_path_index_msg = rosmessage('std_msgs/Int32');
+            obj.desired_path_index_msg.Data = 0; % starts at 0 to indicate no desired path yet
+            
+            % Create publishers
+            obj.robot_pose_pub = rospublisher('/robot/pose', 'turtlesim/Pose');
+            obj.desired_path_index_pub = rospublisher('/desired_path/index', 'std_msgs/Int32');
+            
+            % Create subscribers
+            obj.robot_vel_sub = rossubscriber('/robot/cmd_vel', 'geometry_msgs/Twist', @obj.velocityCallback);
+            obj.robot_reset_sub = rossubscriber('/reset', 'std_msgs/Empty', @obj.resetCallback);
+            
+            % Simulation update rate
+            obj.frequency = 10; % Hz
+            obj.delta_time = 1/obj.frequency;
+            obj.loop_rate = rosrate(obj.frequency);
+            obj.simulation_time = 0;
+            obj.waiting_for_start = true;
+            
+            
+            %============
+            % Create GUI
+            %============
+            % Figure dimensions
+            obj.grid_min_x = -4;
+            obj.grid_max_x = 4;
+            obj.grid_min_y = -2;
+            obj.grid_max_y = 2;
+            obj.window_width = 1100;
+            obj.window_height = 500;
+            obj.shutdown_simulation = false;
+            obj.exit_for_processing = false;
+            obj.initializeGUI();
+            
+            % Set path tolerance
+            obj.goal_tolerance = 0.05;
+            obj.segment_tolerance = 0.05;
+            
+            %=======================
+            % Generate Robot Visual
+            %=======================
+            % Robot dimensions
+            obj.robot_length = 0.200;
+            obj.robot_width = 0.150;
+
+            % Body
+            obj.robot_objects{1,1} = Base(obj.robot_length, obj.robot_width, obj.gui_figure, obj.starting_pose);
+            % Wheel, left front
+            obj.robot_objects{2,1} = Wheel(obj.robot_length, obj.robot_width, 'lf', obj.gui_figure, obj.starting_pose);
+            % Wheel, left back
+            obj.robot_objects{3,1} = Wheel(obj.robot_length, obj.robot_width, 'lb', obj.gui_figure, obj.starting_pose);
+            % Wheel, right front
+            obj.robot_objects{4,1} = Wheel(obj.robot_length, obj.robot_width, 'rf', obj.gui_figure, obj.starting_pose);
+            % Wheel, right back
+            obj.robot_objects{5,1} = Wheel(obj.robot_length, obj.robot_width, 'rb', obj.gui_figure, obj.starting_pose);
+            % Baselink X Axis
+            obj.robot_objects{6,1} = BaseXAxis(obj.robot_length, obj.gui_figure, obj.starting_pose);
+            % Baselink Y Axis
+            obj.robot_objects{7,1} = BaseYAxis(obj.robot_length, obj.gui_figure, obj.starting_pose);
+            % Tracked Path
+            obj.robot_objects{8,1} = TrackedPath(obj.gui_figure, obj.starting_pose, [obj.LinearVelocity, obj.AngularVelocity], obj.desired_path_index_msg.Data, double(0));
+            
+            % Wait to let the figure start
+            pause(0.5);
+        end
+        
+        function initializeGUI(obj)
+            obj.gui_figure = figure(1);
+            set(obj.gui_figure, 'CloseRequestFcn', @obj.closeFigure)
+            window_dimensions = get(0, 'ScreenSize');
+            width = window_dimensions(3);
+            height = window_dimensions(4);
+            if (obj.window_width > width)
+                obj.window_width = width;
+            end
+            if (obj.window_height > height)
+                obj.window_height = height;
+            end
+            obj.gui_figure.Position = [(width/2 - obj.window_width/2), (height/2 - obj.window_height/2), obj.window_width, obj.window_height];
+            obj.gui_axes = axes;
+            %disableDefaultInteractivity(obj.gui_axes);
+            %obj.gui_axes.Toolbar.Visible = 'off';
+            %plotedit off;
+            
+            % Set starting view
+            axis equal;
+            set(obj.gui_axes, 'XLim', [obj.grid_min_x, obj.grid_max_x]);
+            set(obj.gui_axes, 'YLim', [obj.grid_min_y, obj.grid_max_y]);
+            
+            % Create bounding box
+            box = plot([obj.grid_min_x, obj.grid_max_x, obj.grid_max_x, obj.grid_min_x, obj.grid_min_x], ...
+                       [obj.grid_min_y, obj.grid_min_y, obj.grid_max_y, obj.grid_max_y, obj.grid_min_y]);
+            box.LineWidth = 2;
+            box.Color = 'k';
+        end
+        
+        function drawRobot(obj)
+            for i = 1:7
+                obj.robot_objects{i}.updatePoints([obj.X, obj.Y, obj.Theta]);
+            end
+            obj.robot_objects{8}.updatePoints([obj.X, obj.Y, obj.Theta], [obj.LinearVelocity, obj.AngularVelocity], obj.desired_path_index_msg.Data, double(obj.simulation_time));
+        end
+        
+        function spinOnce(obj)
+            %--- Update pose using previous velocity ---%
+            % Rotate velocity to get dx and dy for current orientation
+            R = obj.rot2D(obj.Theta);
+            dv = R*[obj.LinearVelocity;0];
+            dx = dv(1)*obj.delta_time;
+            dy = dv(2)*obj.delta_time;
+
+            % Update pose values (saturate at the boundary)
+            obj.X = obj.X + dx;
+            obj.Y = obj.Y + dy;
+            obj.X = min(obj.X, obj.grid_max_x);
+            obj.X = max(obj.X, obj.grid_min_x);
+            obj.Y = min(obj.Y, obj.grid_max_y);
+            obj.Y = max(obj.Y, obj.grid_min_y);
+            
+            % Update orientation
+            dTheta = obj.AngularVelocity*obj.delta_time;
+            obj.Theta = wrapToPi(obj.Theta + dTheta);
+            
+            % Redraw the robot
+            obj.drawRobot();
+            
+            %--- Update current velocity ---%
+            obj.LinearVelocity = obj.LinearVelocity + sign(obj.linear_velocity_setpoint-obj.LinearVelocity)*obj.linear_acceleration*obj.delta_time;
+            obj.AngularVelocity = obj.AngularVelocity + sign(obj.angular_velocity_setpoint-obj.AngularVelocity)*obj.angular_acceleration*obj.delta_time;
+            
+            % Saturate the velocities at the max values (positive or
+            % negative)
+            if (obj.linear_velocity_setpoint >= 0)
+                obj.LinearVelocity = min(obj.LinearVelocity, min(obj.max_linear_velocity, obj.linear_velocity_setpoint));
+            else
+                obj.LinearVelocity = max(obj.LinearVelocity, max(-obj.max_linear_velocity, obj.linear_velocity_setpoint));
+            end
+            
+            if (obj.angular_velocity_setpoint >= 0)
+                obj.AngularVelocity = min(obj.AngularVelocity, min(obj.max_angular_velocity, obj.angular_velocity_setpoint));
+            else
+                obj.AngularVelocity = max(obj.AngularVelocity, max(-obj.max_angular_velocity, obj.angular_velocity_setpoint));
+            end
+            
+            %----- Publish the current pose -----%
+            obj.robot_pose_msg.X = obj.X;
+            obj.robot_pose_msg.Y = obj.Y;
+            obj.robot_pose_msg.Theta = obj.Theta;
+            obj.robot_pose_msg.LinearVelocity = obj.LinearVelocity;
+            obj.robot_pose_msg.AngularVelocity = obj.AngularVelocity;
+            obj.robot_pose_pub.send(obj.robot_pose_msg);
+            
+            %----- Check the Desired Path's Segment -----%
+            path = obj.robot_objects{9,1}.getPath();
+            % Calculate the along-track error for the given segment
+            % && obj.desired_path_index_msg.Data < (size(path,2) - 1)
+            if (obj.desired_path_index_msg.Data > 0)
+                point1 = path(:,obj.desired_path_index_msg.Data);
+                point2 = path(:,obj.desired_path_index_msg.Data+1);
+                
+                % Segment vector going from point2 to point1
+                v_s = point1 - point2;
+                
+                % Robot vector going from point2 to the robot's position
+                v_r = [obj.X;obj.Y] - point2;
+                
+                along_track_error = dot(v_r, v_s/norm(v_s));
+                
+                % Increment to the next segment if within tolerance
+                while (along_track_error < obj.segment_tolerance && obj.desired_path_index_msg.Data < size(path,2)-1)
+                    obj.desired_path_index_msg.Data = obj.desired_path_index_msg.Data + 1;
+                    
+                    % Repeat along track error calculation
+                    point1 = path(:,obj.desired_path_index_msg.Data);
+                    point2 = path(:,obj.desired_path_index_msg.Data+1);
+                    v_s = point1 - point2;
+                    v_r = [obj.X;obj.Y] - point2;
+                    along_track_error = dot(v_r, v_s/norm(v_s));
+                end
+                
+                % Publish the new index
+                obj.desired_path_index_pub.send(obj.desired_path_index_msg);
+                    
+                % Update the segment in the figure
+                obj.robot_objects{9,1}.updateCurrentSegment(obj.desired_path_index_msg.Data);
+                
+                %----- Check goal and last segment -----%
+                goal_error = sqrt((path(1,end) - obj.X)^2 + (path(2,end) - obj.Y)^2);
+
+                if (goal_error < obj.goal_tolerance || obj.desired_path_index_msg.Data >= (size(path, 2)-1))
+                    obj.exit_for_processing = true;
+                end
+            end
+
+            %----- Update simulation time -----%
+            if (~obj.waiting_for_start)
+                obj.simulation_time = obj.simulation_time + obj.delta_time;
+            end
+                        
+            waitfor(obj.loop_rate);
+        end
+
+        function setDesiredPath(obj, path)
+            % path: 2 x N array of points 
+            %       [x1, x2, ..., xN; y1, y2, ..., yN]
+            obj.robot_objects{9,1} = DesiredPath(obj.gui_figure, path);
+            
+            % Turn on the segment visibility for tracking the current
+            % target segment
+            obj.robot_objects{9,1}.setSegmentVisibility('on');
+            
+            % Set desired path index to 1 indicating a path has been
+            % received
+            obj.desired_path_index_msg.Data = 1;
+            
+            % Publish the updated index
+            obj.desired_path_index_pub.send(obj.desired_path_index_msg);
+            
+            % Update the segment in the figure
+            obj.robot_objects{9,1}.updateCurrentSegment(obj.desired_path_index_msg.Data);
+        end
+        
+        function [path] = getDesiredPath(obj)
+            % path: 2 x N array of points
+            path = double(obj.robot_objects{9,1}.getPath());
+        end
+        
+        function [data] = getTrackedData(obj)
+            % data: 7 x N array of data
+            % [x, y, theta, linear_velocity, angular_velocity, index, time]
+            data = double(obj.robot_objects{8,1}.getData());
+        end
+        
+        function setGoalTolerance(obj, tol)
+            % tol: the new goal tolerance
+            obj.goal_tolerance = tol;
+        end
+        
+        function setSegmentTolerance(obj, tol)
+            % tol: the new segment tolerance
+            obj.segment_tolerance = tol;
+        end
+        
+        function setSimulationFrequency(obj, frequency)
+            % frequency: the simulation frequency in Hz
+            
+            % Simulation update rate
+            obj.frequency = frequency; % Hz
+            obj.delta_time = 1/obj.frequency;
+            obj.loop_rate = rosrate(obj.frequency);
+        end
+        
+        function velocityCallback(obj, ~, msg)
+            if (obj.waiting_for_start)
+                obj.simulation_time = 0;
+                obj.waiting_for_start = false;
+            end
+            % Store the new velocity commands
+            obj.linear_velocity_setpoint = msg.Linear.X;
+            obj.angular_velocity_setpoint = msg.Angular.Z;
+        end
+        
+        function resetCallback(obj, ~, msg)
+            % Reset the robots pose and velocity
+            obj.X = obj.starting_pose(1);
+            obj.Y = obj.starting_pose(2);
+            obj.Theta = obj.starting_pose(3);
+            obj.LinearVelocity = 0.0;
+            obj.AngularVelocity = 0.0;
+            obj.linear_velocity_setpoint = 0.0;
+            obj.angular_velocity_setpoint = 0.0;
+            
+            % Clear the tracked path
+            obj.robot_objects{8,1}.resetPath(obj.starting_pose);
+            
+            % Reset the desired path index, if a desired path has been set
+            if (obj.desired_path_index_msg.Data > 0)
+                obj.desired_path_index_msg.Data = 1;
+            end
+            
+            % If simulation has already exited for processing, reset that
+            % parameter
+            obj.exit_for_processing = false;
+            
+            % Wait for a new velocity command before starting the timer
+            obj.simulation_time = 0;
+            obj.waiting_for_start = true;
+        end
+        
+        function [] = closeFigure(obj, src, callbackdata)
+            % Delete the figure
+            delete(gcf);
+            
+            % Set flag to shutdown simulation
+            obj.shutdown_simulation = true;
+        end
+    end
+    
+    methods (Static)
+        function [R] = rot2D(theta)
+            R = [cos(theta) -sin(theta);
+                 sin(theta)  cos(theta)];
+        end
+        
+        function [T] = trans2D(theta, d)
+            % Create the rotation matrix
+            R = obj.rot2D(theta);
+    
+            % Combine with translation
+            T = [  R  , d;
+                 [0,0], 1];
+        end
+        
+        function startROS()
+            try
+                rosinit;
+            catch
+            end
+        end
+    end
+end

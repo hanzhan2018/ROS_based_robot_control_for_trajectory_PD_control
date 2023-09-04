@@ -1,0 +1,205 @@
+% control_node: Write your control node to have the robot follow the
+% desired path. An example layout has been provided below with some starter
+% code. Feel free to rearrange the setup, you do not have to follow the
+% given structure.
+%
+% HINT:
+%   You will most likely want to use global variables to save the
+%   subscriber message values since you need to store them in the callback
+%   function and then reference them in the main code block.
+%
+%   Topics
+%   ----------
+%   Published: /robot/cmd_vel
+%   Message Type: geometry_msgs/Twist
+%   Info: The linear and angular velocity of the robot. The linear velocity
+%         command comes from Twist.Linear.X and the angular velocity
+%         command comes from Twist.Angular.Z.
+%
+%   Published: /reset
+%   Message Type: std_msgs/Empty
+%   Info: Resets the robot to the starting pose at 0 velocity.
+%
+%   Subscribed: /desired_path/index
+%   Message Type: std_msgs/Int32
+%   Info: The index of the desired path array that references the first
+%         point in the currently tracked segment of the path.
+%
+%   Subscribed: /robot/pose
+%   Message Type: turtlesim/Pose
+%   Info: The 2D pose of the robot including (x,y) position and the
+%         orientation angle. Also contains the current linear and angular
+%         velocities.
+
+%=========================================================================%
+% Setup ROS
+%=========================================================================%
+try
+    rosinit;
+catch
+end
+
+global pose_x pose_y pose_theta ron number
+
+ron = 2;
+global cmd_vel_pub 
+cmd_vel_pub = rospublisher('/robot/cmd_vel', 'geometry_msgs/Twist');
+
+
+% Reset Publisher
+global reset_pub
+reset_pub = rospublisher('/reset','std_msgs/Empty');
+
+global vel_msg reset_msg
+vel_msg = rosmessage(cmd_vel_pub);
+reset_msg = rosmessage(reset_pub);
+
+% Index Subscriber
+global index
+index = rossubscriber('/desired_path/index','std_msgs/Int32',@indexCallback);
+
+% Pose Subscriber
+
+global pose
+pose = rossubscriber('/robot/pose','turtlesim/Pose',@poseCallback);
+
+%=========================================================================%
+% Set Control Gains
+%=========================================================================%
+% Define control gains in one place for easy adjustment
+Kp = 1.0; % Angular proportional gain
+Kh = 0.8; % Linear gain from heading 
+Khe = 0.9; % Linear proportional gain
+v_max = 1.25; % Maximum velocity to use
+% Kp = 0.85; % Angular proportional gain
+% Kh = 0.5; % Linear gain from heading 
+% Khe = 0.83; % Linear proportional gain
+% v_max = 0.75; % Maximum velocity to use
+%=========================================================================%
+% Set Desired Path
+%=========================================================================%
+% This section loads the desired path for you. Just make sure the
+% "desired_path.mat" file exists in the same folder as this function.
+% The desired path will be a 2 x N matrix. X is the first row, Y is the
+% second row.
+%
+% desired_path = [x1, x2, x3, ..., x_n; y1, y2, y3, ..., y_n]
+%
+% Load the control points for the desired path
+file = load('desired_path.mat');
+control_points = file.control_points;
+resolution = file.resolution;
+desired_path = bspline(control_points, resolution);
+
+%=========================================================================%
+% Get First Messages
+%=========================================================================%
+% Wait until at least one message has been received for the pose and the
+% desired path index. You do this by using the "receive" command. It will
+% wait until a message has been received before continuing to the next
+% line. 
+%
+% Syntax
+% [index message] = [index subscriber].receive()
+% [pose message] = [pose subscriber].receive()
+% global index_msg pose_msg
+% index_msg = index.receive();
+% pose_msg = pose.receive();
+
+% You will also want to wait until the desired path has been set by the
+% simulation node. Until the path is set, the index will be 0.
+
+
+% Wait in a while loop until the desire path index is >= 1.
+global index_msg pose_msg
+
+
+%=========================================================================%
+% Control Loop
+%=========================================================================%
+while (true)
+    global pose_x pose_y pose_theta cmd_vel_pub vel_msg index index_msg number
+    index_msg = receive(index);
+    pose_msg = receive(pose);
+    % fprintf("index: %g \n",index_msg.Data);
+    % fprintf("x: %g \n",pose_msg.X);
+    % fprintf("y: %g \n",pose_msg.Y);
+    
+
+    % pose_msg = pose.receive();
+    % TO-DO:
+    % * Calculate path errors
+    %   * Along-track error
+    %   * Cross-track error  
+    p1 = desired_path(:, index_msg.Data);
+    p2 = desired_path(:, index_msg.Data+1);
+    % pr = [pose_x;pose_y];
+    pr = [pose_msg.X;pose_msg.Y];
+
+    path_heading = atan2(p2(2) - p1(2), p2(1) - p1(1));
+
+    theta_pr = path_heading + pi; % reverse path direction
+
+    v_r = pr - p2;
+
+    % Rotate the robot vector to find the along-track and cross-track
+    % errors
+    v_r_rotate = rot2D(-theta_pr)*v_r;
+
+    cte = v_r_rotate(2);
+    ate = v_r_rotate(1);
+
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % * Determine heading setpoint
+    cte = sat(-Kh,cte,Kh);
+
+    theta_setpoint = path_heading + (cte/Kh)*(pi/2); 
+
+    % * Determine linear velocity setpoint
+    theta_headinge = theta_setpoint - pose_msg.Theta;
+
+    % theta_headinge = theta_setpoint - pose_theta;
+
+    vel_setpoint = v_max - Khe*abs(theta_headinge);
+    vel_setpoint = max(vel_setpoint,0);
+
+    % * Calculate angular velocity using PID controller
+    angvel_setpoint = Kp * theta_headinge;
+
+    % * Set Twist message and publish
+    vel_msg.Linear.X = vel_setpoint;
+    vel_msg.Angular.Z = angvel_setpoint;
+    
+    
+    %fprintf("linear velocity: %g \n",vel_setpoint);
+    %fprintf("angle velocity: %g \n",angvel_setpoint);
+    cmd_vel_pub.send(vel_msg);
+
+ 
+
+    % * Don't forget to PAUSE at the end of the loop. Have your control
+    %   loop running slightly faster than the simulation frequency.
+
+    pause(.02);
+end
+
+%=========================================================================%
+% Subscriber Callback Functions
+%=========================================================================%
+% Index Callback
+function [] = indexCallback(~,msg)
+    global index number
+    % index = msg.Data;
+    number = msg.Data;
+end
+
+% TODO
+% * Finish a callback function for the pose
+function [] = poseCallback(~,msg)
+    global pose_x pose_y pose_theta pose
+    % pose = msg;
+    pose_x = msg.X;
+    pose_y = msg.Y;
+    pose_theta = msg.Theta;
+end
